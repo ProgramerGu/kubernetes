@@ -17,15 +17,18 @@ limitations under the License.
 package statefulset
 
 import (
+	"fmt"
 	"math"
 	"sort"
 
 	"k8s.io/klog"
 
 	apps "k8s.io/api/apps/v1"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/kubernetes/pkg/apis/ipam"
 	"k8s.io/kubernetes/pkg/controller/history"
 )
 
@@ -231,7 +234,6 @@ func (ssc *defaultStatefulSetControl) getStatefulSetRevisions(
 	for i := range revisions {
 		if revisions[i].Name == set.Status.CurrentRevision {
 			currentRevision = revisions[i]
-			break
 		}
 	}
 
@@ -242,6 +244,11 @@ func (ssc *defaultStatefulSetControl) getStatefulSetRevisions(
 
 	return currentRevision, updateRevision, collisionCount, nil
 }
+
+//egde add for host bind
+const (
+	baiduNodeAffinityAnno = "bec.baidu.com/node-affinity"
+)
 
 // updateStatefulSet performs the update function for a StatefulSet. This method creates, updates, and deletes Pods in
 // the set in order to conform the system to the target state for the set. The target state always contains
@@ -367,9 +374,14 @@ func (ssc *defaultStatefulSetControl) updateStatefulSet(
 
 	monotonic := !allowsBurst(set)
 
+	//var podNodeBinds string
+	//var notCreatedPod int
+
 	// Examine each replica with respect to its ordinal
+	klog.V(4).Infof("hostbind get pod binds replicas : %d", len(replicas))
 	for i := range replicas {
 		// delete and recreate failed pods
+		klog.V(4).Infof("hostbind get pod binds replicas[i] : %d", i)
 		if isFailed(replicas[i]) {
 			ssc.recorder.Eventf(set, v1.EventTypeWarning, "RecreatingFailedPod",
 				"StatefulSet %s/%s is recreating failed Pod %s",
@@ -395,6 +407,24 @@ func (ssc *defaultStatefulSetControl) updateStatefulSet(
 		}
 		// If we find a Pod that has not been created we create the Pod
 		if !isCreated(replicas[i]) {
+			klog.V(4).Infof("hostbind get pod binds replicas[i] : %d not created", i)
+			//notCreatedPod++
+			//if notCreatedPod == 1 {
+			//request etcd to see if the pod already has host bind,if it do,add it to annotation
+			klog.V(4).Infof("hostbind get pod binds podname: %s,ns : %s", set.Name, set.Namespace)
+			podNodeBinds, err := ipam.Config().GetBindPodsByNetwork(replicas[i])
+			if err != nil {
+				utilruntime.HandleError(fmt.Errorf("StatefulSet %s/%s can not get bindinfo %s", set.Namespace, set.Name, err))
+				klog.V(4).Infof("hostbind get pod binds error: %s", err.Error())
+			}
+			//}
+			klog.V(4).Infof("hostbind get pod %s-%s binds: %s", set.Name, set.Namespace, podNodeBinds)
+			if len(podNodeBinds) > 0 {
+				klog.V(4).Infof("hostbind get pod %s-%s binds: %s success", set.Name, set.Namespace, podNodeBinds)
+				//Will append node affinity
+				replicas[i].Annotations[baiduNodeAffinityAnno] = podNodeBinds
+			}
+
 			if err := ssc.podControl.CreateStatefulPod(set, replicas[i]); err != nil {
 				return &status, err
 			}
@@ -448,7 +478,7 @@ func (ssc *defaultStatefulSetControl) updateStatefulSet(
 	// At this point, all of the current Replicas are Running and Ready, we can consider termination.
 	// We will wait for all predecessors to be Running and Ready prior to attempting a deletion.
 	// We will terminate Pods in a monotonically decreasing order over [len(pods),set.Spec.Replicas).
-	// Note that we do not resurrect Pods in this interval. Also note that scaling will take precedence over
+	// Note that we do not resurrect Pods in this interval. Also not that scaling will take precedence over
 	// updates.
 	for target := len(condemned) - 1; target >= 0; target-- {
 		// wait for terminating pods to expire

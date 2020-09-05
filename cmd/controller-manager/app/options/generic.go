@@ -20,35 +20,48 @@ import (
 	"fmt"
 	"strings"
 
+	apimachineryconfig "k8s.io/apimachinery/pkg/apis/config"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
-	cliflag "k8s.io/component-base/cli/flag"
-	componentbaseconfig "k8s.io/component-base/config"
+	apiserverconfig "k8s.io/apiserver/pkg/apis/config"
+	apiserverflag "k8s.io/apiserver/pkg/util/flag"
+	"k8s.io/kubernetes/pkg/apis/ipam"
 	"k8s.io/kubernetes/pkg/client/leaderelectionconfig"
 	kubectrlmgrconfig "k8s.io/kubernetes/pkg/controller/apis/config"
 )
 
 // GenericControllerManagerConfigurationOptions holds the options which are generic.
 type GenericControllerManagerConfigurationOptions struct {
-	*kubectrlmgrconfig.GenericControllerManagerConfiguration
-	Debugging *DebuggingOptions
+	Port                    int32
+	Address                 string
+	MinResyncPeriod         metav1.Duration
+	ClientConnection        apimachineryconfig.ClientConnectionConfiguration
+	ControllerStartInterval metav1.Duration
+	LeaderElection          apiserverconfig.LeaderElectionConfiguration
+	Debugging               *DebuggingOptions
+	Controllers             []string
 }
 
 // NewGenericControllerManagerConfigurationOptions returns generic configuration default values for both
 // the kube-controller-manager and the cloud-contoller-manager. Any common changes should
 // be made here. Any individual changes should be made in that controller.
-func NewGenericControllerManagerConfigurationOptions(cfg *kubectrlmgrconfig.GenericControllerManagerConfiguration) *GenericControllerManagerConfigurationOptions {
+func NewGenericControllerManagerConfigurationOptions(cfg kubectrlmgrconfig.GenericControllerManagerConfiguration) *GenericControllerManagerConfigurationOptions {
 	o := &GenericControllerManagerConfigurationOptions{
-		GenericControllerManagerConfiguration: cfg,
-		Debugging: &DebuggingOptions{
-			DebuggingConfiguration: &componentbaseconfig.DebuggingConfiguration{},
-		},
+		Port:                    cfg.Port,
+		Address:                 cfg.Address,
+		MinResyncPeriod:         cfg.MinResyncPeriod,
+		ClientConnection:        cfg.ClientConnection,
+		ControllerStartInterval: cfg.ControllerStartInterval,
+		LeaderElection:          cfg.LeaderElection,
+		Debugging:               &DebuggingOptions{},
+		Controllers:             cfg.Controllers,
 	}
 
 	return o
 }
 
 // AddFlags adds flags related to generic for controller manager to the specified FlagSet.
-func (o *GenericControllerManagerConfigurationOptions) AddFlags(fss *cliflag.NamedFlagSets, allControllers, disabledByDefaultControllers []string) {
+func (o *GenericControllerManagerConfigurationOptions) AddFlags(fss *apiserverflag.NamedFlagSets, allControllers, disabledByDefaultControllers []string) {
 	if o == nil {
 		return
 	}
@@ -59,7 +72,13 @@ func (o *GenericControllerManagerConfigurationOptions) AddFlags(fss *cliflag.Nam
 	genericfs.StringVar(&o.ClientConnection.ContentType, "kube-api-content-type", o.ClientConnection.ContentType, "Content type of requests sent to apiserver.")
 	genericfs.Float32Var(&o.ClientConnection.QPS, "kube-api-qps", o.ClientConnection.QPS, "QPS to use while talking with kubernetes apiserver.")
 	genericfs.Int32Var(&o.ClientConnection.Burst, "kube-api-burst", o.ClientConnection.Burst, "Burst to use while talking with kubernetes apiserver.")
+	genericfs.StringVar(&ipam.Ipam.EtcdURL, "etcdURL", ipam.Ipam.EtcdURL, "The etcd url that the ipam's http service runs on")
+	genericfs.StringVar(&ipam.Ipam.EtcdCertFile, "etcdCertFile", ipam.Ipam.EtcdCertFile, "The etcd cert file that the ipam's        http service use")
+	genericfs.StringVar(&ipam.Ipam.EtcdKeyFile, "etcdKeyFile", ipam.Ipam.EtcdKeyFile, "The etcd key file that the ipam's http       service use")
+	genericfs.StringVar(&ipam.Ipam.EtcdTrustedCAFile, "etcdTrustedCAFile", ipam.Ipam.EtcdTrustedCAFile, "The etcd trusted           CAFile file that the ipam's http service use")
+	genericfs.StringVar(&ipam.Ipam.EtcdPrefix, "etcdPrefix", ipam.Ipam.EtcdPrefix, "The etcd prefix that the ipam's http            service use")
 	genericfs.DurationVar(&o.ControllerStartInterval.Duration, "controller-start-interval", o.ControllerStartInterval.Duration, "Interval between starting controller managers.")
+	// TODO: complete the work of the cloud-controller-manager (and possibly other consumers of this code) respecting the --controllers flag
 	genericfs.StringSliceVar(&o.Controllers, "controllers", o.Controllers, fmt.Sprintf(""+
 		"A list of controllers to enable. '*' enables all on-by-default controllers, 'foo' enables the controller "+
 		"named 'foo', '-foo' disables the controller named 'foo'.\nAll controllers: %s\nDisabled-by-default controllers: %s",
@@ -103,7 +122,9 @@ func (o *GenericControllerManagerConfigurationOptions) Validate(allControllers [
 		if controller == "*" {
 			continue
 		}
-		controller = strings.TrimPrefix(controller, "-")
+		if strings.HasPrefix(controller, "-") {
+			controller = controller[1:]
+		}
 		if !allControllersSet.Has(controller) {
 			errs = append(errs, fmt.Errorf("%q is not in the list of known controllers", controller))
 		}

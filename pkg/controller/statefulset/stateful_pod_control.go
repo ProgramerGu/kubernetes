@@ -21,7 +21,7 @@ import (
 	"strings"
 
 	apps "k8s.io/api/apps/v1"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	errorutils "k8s.io/apimachinery/pkg/util/errors"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -30,6 +30,7 @@ import (
 	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/retry"
+	"k8s.io/klog"
 )
 
 // StatefulPodControlInterface defines the interface that StatefulSetController uses to create, update, and delete Pods,
@@ -70,12 +71,24 @@ type realStatefulPodControl struct {
 	recorder  record.EventRecorder
 }
 
+const (
+	baiduNodeAffinityKey = "kubernetes.io/hostname"
+)
+
 func (spc *realStatefulPodControl) CreateStatefulPod(set *apps.StatefulSet, pod *v1.Pod) error {
 	// Create the Pod's PVCs prior to creating the Pod
 	if err := spc.createPersistentVolumeClaims(set, pod); err != nil {
 		spc.recordPodEvent("create", set, pod, err)
 		return err
 	}
+
+	//if baiduNodeAffinityAnno has value,pod already has host bind,add host bind to node affinity
+	klog.V(4).Infof("hostbind pod %s baiduNodeAffinityAnno : %s", pod.Name, pod.Annotations[baiduNodeAffinityAnno])
+	if len(pod.Annotations[baiduNodeAffinityAnno]) != 0 {
+		spc.appendAffinity(pod, baiduNodeAffinityKey, pod.Annotations[baiduNodeAffinityAnno])
+		klog.V(4).Infof("hostbind pod %s baiduNodeAffinityAnno done", pod.Name)
+	}
+
 	// If we created the PVCs attempt to create the Pod
 	_, err := spc.client.CoreV1().Pods(set.Namespace).Create(pod)
 	// sink already exists errors
@@ -184,18 +197,60 @@ func (spc *realStatefulPodControl) createPersistentVolumeClaims(set *apps.Statef
 		case apierrors.IsNotFound(err):
 			_, err := spc.client.CoreV1().PersistentVolumeClaims(claim.Namespace).Create(&claim)
 			if err != nil {
-				errs = append(errs, fmt.Errorf("failed to create PVC %s: %s", claim.Name, err))
+				errs = append(errs, fmt.Errorf("Failed to create PVC %s: %s", claim.Name, err))
 			}
 			if err == nil || !apierrors.IsAlreadyExists(err) {
 				spc.recordClaimEvent("create", set, pod, &claim, err)
 			}
 		case err != nil:
-			errs = append(errs, fmt.Errorf("failed to retrieve PVC %s: %s", claim.Name, err))
+			errs = append(errs, fmt.Errorf("Failed to retrieve PVC %s: %s", claim.Name, err))
 			spc.recordClaimEvent("create", set, pod, &claim, err)
 		}
 		// TODO: Check resource requirements and accessmodes, update if necessary
 	}
 	return errorutils.NewAggregate(errs)
+}
+
+//edge add to add node affinity
+func (spc *realStatefulPodControl) appendAffinity(pod *v1.Pod, key string, value string) {
+	if pod.Spec.Affinity == nil {
+		pod.Spec.Affinity = &v1.Affinity{}
+	}
+	if pod.Spec.Affinity.NodeAffinity == nil {
+		pod.Spec.Affinity.NodeAffinity = &v1.NodeAffinity{}
+	}
+	if pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = &v1.NodeSelector{}
+	}
+	if len(pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms) == 0 {
+		pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms =
+			[]v1.NodeSelectorTerm{
+				{
+					MatchExpressions: []v1.NodeSelectorRequirement{
+						{
+							//Key:      TorKey,
+							Key:      key,
+							Operator: v1.NodeSelectorOpIn,
+							//Values:   []string{torInfo},
+							Values: []string{value},
+						},
+					},
+				},
+			}
+	} else {
+		for i := range pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms {
+			pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[i].MatchExpressions = append(
+				pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[i].MatchExpressions,
+				v1.NodeSelectorRequirement{
+					//Key:      TorKey,
+					Key:      key,
+					Operator: v1.NodeSelectorOpIn,
+					//Values:   []string{torInfo},
+					Values: []string{value},
+				},
+			)
+		}
+	}
 }
 
 var _ StatefulPodControlInterface = &realStatefulPodControl{}
